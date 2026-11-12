@@ -1,0 +1,329 @@
+
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <title>RAG Evaluation Report</title>
+
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                background: #f4f6fa;
+                padding: 30px;
+                color: #222;
+            }
+
+            .container {
+                max-width: 1100px;
+                margin: auto;
+                background: white;
+                padding: 30px;
+                border-radius: 12px;
+            }
+
+            .metrics {
+                display: flex;
+                gap: 20px;
+                flex-wrap: wrap;
+            }
+
+            .metric {
+                background: #f1f4f9;
+                padding: 20px;
+                border-radius: 8px;
+                flex: 1;
+                min-width: 150px;
+            }
+
+            table {
+                width: 100%;
+                border-collapse: collapse;
+                margin-top: 25px;
+            }
+
+            th, td {
+                padding: 12px;
+                text-align: left;
+                border-bottom: 1px solid #ddd;
+            }
+
+            th {
+                background: #edf1f7;
+            }
+
+            .pass {
+                color: #16803c;
+                font-weight: bold;
+            }
+
+            .fail {
+                color: #d32f2f;
+                font-weight: bold;
+            }
+        </style>
+    </head>
+
+    <body>
+    <div class="container">
+
+        <h1>Cattle Health RAG Evaluation</h1>
+
+        <p>Generated: 12-11-2026 11:41:29</p>
+
+        <div class="metrics">
+
+            <div class="metric">
+                <h2>29</h2>
+                <p>Total Checks</p>
+            </div>
+
+            <div class="metric">
+                <h2 class="pass">28</h2>
+                <p>Passed</p>
+            </div>
+
+            <div class="metric">
+                <h2 class="fail">1</h2>
+                <p>Failed</p>
+            </div>
+
+            <div class="metric">
+                <h2>0.42s</h2>
+                <p>Average Retrieval Time</p>
+            </div>
+
+            <div class="metric">
+                <h2>0.00s</h2>
+                <p>Live RAG Time (if enabled)</p>
+            </div>
+
+        </div>
+
+        <h2>Detailed Test Results</h2>
+
+        <table>
+            <tr>
+                <th>Category</th>
+                <th>Test</th>
+                <th>Status</th>
+                <th>Details</th>
+            </tr>
+
+            
+        <tr>
+            <td>Input Validation</td>
+            <td>Valid cattle question</td>
+            <td class="pass">PASS</td>
+            <td>Validation behaved as expected</td>
+        </tr>
+        
+        <tr>
+            <td>Input Validation</td>
+            <td>Empty input</td>
+            <td class="pass">PASS</td>
+            <td>Please enter a question.</td>
+        </tr>
+        
+        <tr>
+            <td>Input Validation</td>
+            <td>Whitespace input</td>
+            <td class="pass">PASS</td>
+            <td>Please enter a question.</td>
+        </tr>
+        
+        <tr>
+            <td>Input Validation</td>
+            <td>Invalid input type</td>
+            <td class="pass">PASS</td>
+            <td>Invalid input format.</td>
+        </tr>
+        
+        <tr>
+            <td>Input Validation</td>
+            <td>Input exceeding limit</td>
+            <td class="pass">PASS</td>
+            <td>Your message is too long. Maximum 2000 characters.</td>
+        </tr>
+        
+        <tr>
+            <td>Guardrails</td>
+            <td>Cattle question allowed</td>
+            <td class="pass">PASS</td>
+            <td>Expected classification received</td>
+        </tr>
+        
+        <tr>
+            <td>Guardrails</td>
+            <td>Unrelated question blocked</td>
+            <td class="pass">PASS</td>
+            <td>I&#x27;m a specialised Cattle Health Assistant. I can help with cattle diseases, symptoms, prevention, veterinary information, BCS, dairy nutrition and livestock management. Please ask a related question.</td>
+        </tr>
+        
+        <tr>
+            <td>Guardrails</td>
+            <td>Prompt injection blocked</td>
+            <td class="pass">PASS</td>
+            <td>I&#x27;m a specialised Cattle Health Assistant. I can help with cattle diseases, symptoms, prevention, veterinary information, BCS, dairy nutrition and livestock management. Please ask a related question.</td>
+        </tr>
+        
+        <tr>
+            <td>Guardrails</td>
+            <td>Classifier failure blocks request</td>
+            <td class="pass">PASS</td>
+            <td>I&#x27;m unable to verify your question right now. Please try again later.</td>
+        </tr>
+        
+        <tr>
+            <td>Medication Safety</td>
+            <td>Individual antibiotic dosage</td>
+            <td class="pass">PASS</td>
+            <td>Detected: True; Expected: True</td>
+        </tr>
+        
+        <tr>
+            <td>Medication Safety</td>
+            <td>Individual mastitis treatment</td>
+            <td class="pass">PASS</td>
+            <td>Detected: True; Expected: True</td>
+        </tr>
+        
+        <tr>
+            <td>Medication Safety</td>
+            <td>Individual animal prescription</td>
+            <td class="pass">PASS</td>
+            <td>Detected: True; Expected: True</td>
+        </tr>
+        
+        <tr>
+            <td>Medication Safety</td>
+            <td>General medication education</td>
+            <td class="fail">FAIL</td>
+            <td>Detected: True; Expected: False</td>
+        </tr>
+        
+        <tr>
+            <td>Medication Safety</td>
+            <td>General mastitis education</td>
+            <td class="pass">PASS</td>
+            <td>Detected: False; Expected: False</td>
+        </tr>
+        
+        <tr>
+            <td>Retrieval</td>
+            <td>Passages returned: What is mastitis in dairy cattle?</td>
+            <td class="pass">PASS</td>
+            <td>5 passages in 0.51s</td>
+        </tr>
+        
+        <tr>
+            <td>Retrieval</td>
+            <td>Metadata integrity: What is mastitis in dairy cattle?</td>
+            <td class="pass">PASS</td>
+            <td>Metadata structure checked</td>
+        </tr>
+        
+        <tr>
+            <td>Retrieval</td>
+            <td>Passage text integrity: What is mastitis in dairy cattle?</td>
+            <td class="pass">PASS</td>
+            <td>Passage content checked</td>
+        </tr>
+        
+        <tr>
+            <td>Retrieval</td>
+            <td>Passages returned: What are the symptoms of FMD?</td>
+            <td class="pass">PASS</td>
+            <td>5 passages in 0.38s</td>
+        </tr>
+        
+        <tr>
+            <td>Retrieval</td>
+            <td>Metadata integrity: What are the symptoms of FMD?</td>
+            <td class="pass">PASS</td>
+            <td>Metadata structure checked</td>
+        </tr>
+        
+        <tr>
+            <td>Retrieval</td>
+            <td>Passage text integrity: What are the symptoms of FMD?</td>
+            <td class="pass">PASS</td>
+            <td>Passage content checked</td>
+        </tr>
+        
+        <tr>
+            <td>Retrieval</td>
+            <td>Passages returned: How is BCS evaluated in cattle?</td>
+            <td class="pass">PASS</td>
+            <td>5 passages in 0.48s</td>
+        </tr>
+        
+        <tr>
+            <td>Retrieval</td>
+            <td>Metadata integrity: How is BCS evaluated in cattle?</td>
+            <td class="pass">PASS</td>
+            <td>Metadata structure checked</td>
+        </tr>
+        
+        <tr>
+            <td>Retrieval</td>
+            <td>Passage text integrity: How is BCS evaluated in cattle?</td>
+            <td class="pass">PASS</td>
+            <td>Passage content checked</td>
+        </tr>
+        
+        <tr>
+            <td>Retrieval</td>
+            <td>Passages returned: What causes brucellosis in cattle?</td>
+            <td class="pass">PASS</td>
+            <td>5 passages in 0.29s</td>
+        </tr>
+        
+        <tr>
+            <td>Retrieval</td>
+            <td>Metadata integrity: What causes brucellosis in cattle?</td>
+            <td class="pass">PASS</td>
+            <td>Metadata structure checked</td>
+        </tr>
+        
+        <tr>
+            <td>Retrieval</td>
+            <td>Passage text integrity: What causes brucellosis in cattle?</td>
+            <td class="pass">PASS</td>
+            <td>Passage content checked</td>
+        </tr>
+        
+        <tr>
+            <td>Retrieval</td>
+            <td>Passages returned: How can milk production be improved?</td>
+            <td class="pass">PASS</td>
+            <td>5 passages in 0.46s</td>
+        </tr>
+        
+        <tr>
+            <td>Retrieval</td>
+            <td>Metadata integrity: How can milk production be improved?</td>
+            <td class="pass">PASS</td>
+            <td>Metadata structure checked</td>
+        </tr>
+        
+        <tr>
+            <td>Retrieval</td>
+            <td>Passage text integrity: How can milk production be improved?</td>
+            <td class="pass">PASS</td>
+            <td>Passage content checked</td>
+        </tr>
+        
+
+        </table>
+
+        <p>
+            Note: Passing smoke tests does not establish
+            clinical correctness or retrieval relevance.
+            Those require labelled reference data and
+            expert review.
+        </p>
+
+    </div>
+    </body>
+    </html>
+    
