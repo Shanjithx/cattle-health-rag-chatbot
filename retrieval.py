@@ -1,5 +1,6 @@
 import json
 import re
+import time
 import chromadb
 
 from pathlib import Path
@@ -10,6 +11,14 @@ from rank_bm25 import BM25Okapi
 # ==========================================
 # 1. CONFIGURATION
 # ==========================================
+
+STARTUP_TIMER = time.perf_counter()
+STARTUP_TIMINGS = {}
+
+
+def record_startup_stage(stage, start_time):
+    STARTUP_TIMINGS[stage] = time.perf_counter() - start_time
+
 
 DB_PATH = "./vector_db"
 COLLECTION_NAME = "cattle_knowledge"
@@ -28,7 +37,9 @@ CANDIDATE_K = 20
 # ==========================================
 
 print("Loading embedding model...", flush=True)
+_stage_start = time.perf_counter()
 model = SentenceTransformer(MODEL_NAME)
+record_startup_stage("Embedding model", _stage_start)
 
 
 # ==========================================
@@ -36,7 +47,9 @@ model = SentenceTransformer(MODEL_NAME)
 # ==========================================
 
 print("Loading cross-encoder reranking model...", flush=True)
+_stage_start = time.perf_counter()
 reranker = CrossEncoder(RERANKER_NAME)
+record_startup_stage("Cross-encoder model", _stage_start)
 print("Reranking model loaded!", flush=True)
 
 
@@ -45,12 +58,14 @@ print("Reranking model loaded!", flush=True)
 # ==========================================
 
 print("Connecting to ChromaDB...", flush=True)
+_stage_start = time.perf_counter()
 
 client = chromadb.PersistentClient(path=DB_PATH)
 
 collection = client.get_collection(
     name=COLLECTION_NAME
 )
+record_startup_stage("ChromaDB connection", _stage_start)
 
 print("ChromaDB connected!", flush=True)
 
@@ -60,6 +75,7 @@ print("ChromaDB connected!", flush=True)
 # ==========================================
 
 print("Loading document chunks...", flush=True)
+_stage_start = time.perf_counter()
 
 if not CHUNKS_FILE.exists():
     raise FileNotFoundError("chunks.jsonl not found!")
@@ -75,6 +91,7 @@ if not chunks:
     raise ValueError("No document chunks found!")
 
 print(f"Loaded {len(chunks)} chunks!", flush=True)
+record_startup_stage("Document chunks loading", _stage_start)
 
 
 # ==========================================
@@ -155,6 +172,7 @@ def expand_query(question, verbose=False):
 # ==========================================
 
 print("Building BM25 index...", flush=True)
+_stage_start = time.perf_counter()
 
 tokenized_corpus = [
     tokenize(item["text"]) for item in chunks
@@ -163,7 +181,15 @@ tokenized_corpus = [
 bm25 = BM25Okapi(tokenized_corpus)
 
 print("BM25 index ready!", flush=True)
+record_startup_stage("BM25 index construction", _stage_start)
+
+STARTUP_TOTAL = time.perf_counter() - STARTUP_TIMER
 print("Hybrid retrieval and reranking system initialized!", flush=True)
+print("\n========== RETRIEVAL STARTUP TIME ==========", flush=True)
+for _stage, _duration in STARTUP_TIMINGS.items():
+    print(f"{_stage:<28} {_duration:>8.2f} seconds", flush=True)
+print("--------------------------------------------", flush=True)
+print(f"{'TOTAL STARTUP':<28} {STARTUP_TOTAL:>8.2f} seconds", flush=True)
 
 
 # ==========================================
@@ -413,38 +439,57 @@ def hybrid_search(question, top_k=5, verbose=False):
     Set verbose=True when running retrieval.py directly for debugging.
     """
 
+    total_start = time.perf_counter()
+    stage_timings = {}
+
+    stage_start = time.perf_counter()
     retrieval_query = expand_query(question, verbose=verbose)
+    stage_timings["Query expansion"] = time.perf_counter() - stage_start
 
     if verbose:
         print("\\nPerforming dense retrieval...", flush=True)
+    stage_start = time.perf_counter()
     vector_results = vector_search(retrieval_query, top_k=20)
+    stage_timings["Dense retrieval"] = time.perf_counter() - stage_start
 
     if verbose:
         print("\\nPerforming BM25 retrieval...", flush=True)
+    stage_start = time.perf_counter()
     sparse_results = bm25_search(retrieval_query, top_k=20)
+    stage_timings["BM25 retrieval"] = time.perf_counter() - stage_start
 
     if verbose:
         print("\\nCombining results using RRF...", flush=True)
+    stage_start = time.perf_counter()
     candidates = reciprocal_rank_fusion(
         vector_results,
         sparse_results,
         top_k=top_k,
         candidate_k=CANDIDATE_K
     )
+    stage_timings["RRF fusion"] = time.perf_counter() - stage_start
 
     if verbose:
         print(f"RRF candidate pool: {len(candidates)} chunks", flush=True)
 
+    stage_start = time.perf_counter()
     final_results = rerank_results(
         question,
         candidates,
         top_k=top_k,
         verbose=verbose
     )
+    stage_timings["Cross-encoder reranking"] = time.perf_counter() - stage_start
 
     if verbose:
         print_final_rankings(final_results)
         print(f"\\nRetrieved {len(final_results)} reranked passages.", flush=True)
+        print("\\n========== QUERY RETRIEVAL TIME ==========", flush=True)
+        for stage, duration in stage_timings.items():
+            print(f"{stage:<28} {duration:>8.2f} seconds", flush=True)
+        total_time = time.perf_counter() - total_start
+        print("--------------------------------------------", flush=True)
+        print(f"{'TOTAL RETRIEVAL':<28} {total_time:>8.2f} seconds", flush=True)
 
     return final_results
 
