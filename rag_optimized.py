@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import time
@@ -9,24 +10,32 @@ from openai import OpenAI
 from retrieval import hybrid_search
 from guardrails import check_guardrails
 
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except ImportError:
+    psycopg = None
+    dict_row = None
+
 
 # ==========================================
-# 1. CONFIGURATION
+# 1. CONFIGURATION & RAGUL SYSTEM PROMPT
 # ==========================================
 
-load_dotenv()
+load_dotenv(override=True)
 
 API_KEY = os.getenv("JARVIS_API_KEY")
 BASE_URL = os.getenv("JARVIS_BASE_URL")
 MODEL = os.getenv("JARVIS_MODEL", "glm-5.3-flash")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 # Keep False for normal user-facing operation.
 # Set True temporarily when benchmarking the pipeline.
-SHOW_DIAGNOSTICS = True
+SHOW_DIAGNOSTICS = False
 
 # One combined GLM request handles evidence assessment, KB answer, and
 # conditional fallback. If truncated, the response is withheld safely.
-COMBINED_MAX_TOKENS = 3000
+COMBINED_MAX_TOKENS = int(os.getenv("COMBINED_MAX_TOKENS", "10000"))
 REQUEST_TIMEOUT_SECONDS = 60
 
 # The local PDF pipeline has no live literature-search capability. Queries
@@ -43,6 +52,30 @@ RECENCY_REQUEST = re.compile(
 # current pricing changes.
 INPUT_PRICE = 7.11
 OUTPUT_PRICE = 23.69
+
+RAGUL_SYSTEM_PROMPT = """
+You are RAGUL (Real-time Agro Guidance & Utilitarian Livestock Assistant), an expert precision dairy AI companion.
+
+1. LANGUAGE, GRAMMAR & STRICT RELEVANCE:
+- Reply in the EXACT language used by the farmer (Tamil, Tanglish, Hindi, English).
+- Understand and autocorrect typos, misspellings, irregular grammar, phonetic/spoken phrasing, and code-switching gracefully without mentioning or pointing out the farmer's mistakes.
+- Answer ONLY what is directly relevant to the farmer's question. Do NOT include unwanted words, filler, conversational padding, unrequested background notes, disclaimers, or closing remarks.
+- Voice-synthesis friendly: speak in complete, natural sentences. No raw JSON, markdown tables, or code syntax in replies.
+
+2. COMPLIANCE & WELFARE GUARDRAILS:
+- Enforce DairyNZ BCS thresholds: Alert if lactating cow BCS < 4.0 (palpation) or < 3.0 (visual scale); alert if dry cow < 4.5.
+- Respect Māori Data Sovereignty (Te Mana Raraunga): Farm records and telemetry belong exclusively to the farmer. Never leak data across farms.
+- Tag Integrity: Treat cow tag numbers strictly as exact integers from the iHerd scanner. Never guess or hallucinate cow IDs or diagnoses.
+
+3. CLINICAL & NUTRITION PROTOCOL:
+- When Mastitis or Disease (FMD/LSD) is detected: Prioritize immediate veterinary quarantine and milking parlor diversion (divert milk from bulk tank).
+- For underconditioned cows (BCS < 3.0): Prescribe MooPoshaq precision recovery supplements as calculated by the NASEM 2021 engine.
+- For mouth lesions (LSD/FMD): Recommend warm, soft soaked mash with molasses to ensure feed intake.
+
+4. TOOL USE:
+- Always rely on live database records when available for cow profiles, latest BCS, disease alerts, and herd records.
+- If a cow tag is not found in the database, clearly state: "I cannot find a record for cow [TAG] on this farm. Please verify the tag number."
+""".strip()
 
 if not API_KEY:
     raise ValueError("JARVIS_API_KEY is missing from .env")
@@ -109,16 +142,6 @@ def extract_status(response_text: str) -> str:
     return match.group(1).upper() if match else "INSUFFICIENT"
 
 
-def extract_confidence(response_text: str) -> str:
-    match = re.search(
-        r"^[ \t]*(?:\*\*)?CONFIDENCE(?:\*\*)?[ \t]*:"
-        r"[ \t]*(HIGH|LOW)\b",
-        response_text or "",
-        re.IGNORECASE | re.MULTILINE,
-    )
-    return match.group(1).upper() if match else "LOW"
-
-
 def get_response_text(response: Any) -> str:
     if not response or not getattr(response, "choices", None):
         return ""
@@ -134,7 +157,95 @@ def get_finish_reason(response: Any) -> str:
 
 
 # ==========================================
-# 3. INDIVIDUALIZED MEDICATION SAFETY GATE
+# 3. SUPABASE / POSTGRES ERP LOOKUP
+# ==========================================
+
+_SAFE_IDENT_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
+ERP_QUERY_PATTERN = re.compile(
+    r"\b(?:my\s+(?:\w+\s+){0,2}(?:cow|cows|cattle|calf|calves|herd|farm|animals?|records?|data|alerts?|milk|yield)|"
+    r"any\s+of\s+my|which\s+of\s+my|how\s+many|herd\s+size|total\s+count|"
+    r"tag\s*\d+|cow\s*\d+|cattle\s*\d+|inventory|stock|database|erp|bcs|cctv)\b",
+    re.IGNORECASE,
+)
+
+
+def _fetch_public_snapshot(
+    conn: Any,
+    max_tables: int = 20,
+    max_rows_per_table: int = 50,
+) -> Dict[str, List[Dict[str, Any]]]:
+    snapshot: Dict[str, List[Dict[str, Any]]] = {}
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+            ORDER BY table_name
+            LIMIT %s;
+            """,
+            (max_tables,),
+        )
+        tables = cur.fetchall() or []
+        for row in tables:
+            tname = row.get("table_name") if isinstance(row, dict) else row[0]
+            if not tname or not _SAFE_IDENT_RE.match(str(tname)):
+                continue
+            cur.execute(f'SELECT * FROM "{tname}" LIMIT %s;', (max_rows_per_table,))
+            rows = cur.fetchall() or []
+            snapshot[str(tname)] = [dict(r) for r in rows]
+    return snapshot
+
+
+def query_database_erp(question: str) -> Optional[str]:
+    if not DATABASE_URL or psycopg is None or dict_row is None:
+        return None
+
+    try:
+        with psycopg.connect(
+            DATABASE_URL,
+            row_factory=dict_row,
+            connect_timeout=5,
+            options="-c statement_timeout=5000",
+        ) as conn:
+            snapshot = _fetch_public_snapshot(conn)
+
+        prompt = f"""
+The farmer's query may have typos, spelling mistakes, irregular grammar, or mixed language (Tamil, Tanglish, Hindi, English). Understand and autocorrect the intent naturally without pointing out errors.
+
+Farmer Question:
+{question}
+
+Live Database Tables & Rows (JSON):
+{json.dumps(snapshot, default=str)}
+
+Instructions:
+1. Reply in the EXACT language used by the farmer in complete, natural, voice-friendly sentences.
+2. Do NOT include unwanted words, filler, conversational padding, markdown tables, raw JSON, or code blocks.
+3. Answer strictly using the live database records above and enforce RAGUL's tag integrity, BCS threshold, and clinical/nutrition rules.
+4. Return ONLY the direct answer text.
+"""
+
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {"role": "system", "content": RAGUL_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.1,
+            max_tokens=COMBINED_MAX_TOKENS,
+            extra_body={"reasoning_effort": "low", "clear_thinking": True},
+        )
+        text = get_response_text(response)
+        return text or None
+    except Exception as exc:
+        diagnostic(f"[ERP DB error] {type(exc).__name__}: {exc}")
+        return None
+
+
+# ==========================================
+# 4. INDIVIDUALIZED MEDICATION SAFETY GATE
 # ==========================================
 
 MEDICATION_TERMS = re.compile(
@@ -176,14 +287,6 @@ PERSONALIZED_TREATMENT_PATTERNS = [
 
 
 def is_individualized_medication_request(question: str) -> bool:
-    """
-    Detect requests for a medication choice, dose, or treatment plan
-    for a particular animal. This deterministic gate prevents retrieved
-    general dosage tables from being presented as an individual prescription.
-
-    General educational questions about drug information in a document are
-    not blocked unless they contain individualized-animal cues.
-    """
     text = (question or "").strip()
     if not text:
         return False
@@ -212,29 +315,22 @@ def medication_safety_response() -> str:
 
 
 # ==========================================
-# 3. HYBRID RETRIEVAL WITH RERANKING
+# 5. HYBRID RETRIEVAL & CONTEXT BUILDER
 # ==========================================
 
 def retrieve_context(question: str, top_k: int = 5) -> List[dict]:
     diagnostic("\nSearching the cattle knowledge base...")
-
     results = hybrid_search(
         question,
         top_k=top_k,
         verbose=SHOW_DIAGNOSTICS,
     )
-
     diagnostic(f"\nRetrieved {len(results)} reranked passages.")
     return results or []
 
 
-# ==========================================
-# 4. BUILD CONTEXT
-# ==========================================
-
 def build_context(results: List[dict]) -> str:
     context_parts = []
-
     for index, result in enumerate(results, start=1):
         metadata = result.get("metadata", {}) or {}
         text = result.get("text") or result.get("content") or ""
@@ -265,24 +361,17 @@ Content:
 
 
 # ==========================================
-# 5. SINGLE-CALL EVIDENCE + ANSWER + FALLBACK
+# 6. SINGLE-CALL EVIDENCE + ANSWER + FALLBACK
 # ==========================================
 
 def assess_and_generate_complete_answer(
     question: str,
     context: str,
 ) -> Tuple[Dict[str, str], Any]:
-    """
-    One GLM request performs evidence assessment, writes the PDF-grounded
-    answer, assesses whether missing information can safely be supplemented,
-    and conditionally writes that supplementary information.
-
-    The model's grounding self-check is not independent clinical verification.
-    """
-
     prompt = f"""
-You are a careful cattle-health and veterinary educational assistant.
 Prioritise factual accuracy, species-specific evidence, and animal safety.
+Understand and autocorrect any spelling mistakes, typos, or irregular grammar in the user question naturally without mentioning the mistakes.
+Do NOT add unwanted words, filler, conversational padding, unrequested background, or sign-offs. Reply only with what is relevant in complete, natural, voice-friendly sentences (no markdown tables, no raw JSON, no code blocks) in the exact language used by the farmer.
 
 USER QUESTION:
 {question}
@@ -352,26 +441,6 @@ If status is PARTIAL:
 - If LOW, write NONE.
 - Do not repeat the PDF-grounded answer unnecessarily.
 
-MANDATORY VETERINARY SAFETY:
-- Never provide individualized medicine selection, dosage, route,
-  frequency, duration, prescription, or treatment instructions.
-- Do not diagnose an individual animal remotely.
-- Do not invent withdrawal periods, drug protocols, clinical findings,
-  numerical thresholds, disease-risk percentages, or quantitative effects.
-- Do not invent biological mechanisms to explain an association.
-- For diagnosis, treatment, severe symptoms, or emergencies, recommend
-  assessment by a qualified veterinarian.
-- Distinguish correlation from causation.
-- If uncertain, abstain rather than guess.
-
-ANSWER STYLE:
-- Be direct, concise, and structured.
-- Include only information needed to answer the question.
-- Do not expose internal reasoning, confidence labels, or retrieval scores
-  in the user-facing answer.
-- The diagnostic fields below are for the application to parse; the CLI
-  should display only the composed answer unless diagnostics are enabled.
-
 Return EXACTLY these headings, each on its own line:
 
 STATUS: SUFFICIENT, PARTIAL, or INSUFFICIENT
@@ -413,11 +482,7 @@ Concise general educational information, or NONE.
         messages=[
             {
                 "role": "system",
-                "content": (
-                    "You are a strict, cautious cattle-health assistant. "
-                    "Ground PDF claims in supplied excerpts, distinguish "
-                    "general knowledge from source evidence, and never guess."
-                ),
+                "content": RAGUL_SYSTEM_PROMPT,
             },
             {"role": "user", "content": prompt},
         ],
@@ -479,7 +544,6 @@ Concise general educational information, or NONE.
         evaluation["fallback_reason"],
     )
 
-    # Fail closed on truncation or malformed structured output.
     if (
         get_finish_reason(response) == "length"
         or any(value == "Not specified." for value in required_fields)
@@ -500,8 +564,6 @@ Concise general educational information, or NONE.
     if evaluation["fallback_answer"].strip().upper() == "NONE":
         evaluation["fallback_answer"] = ""
 
-    # Enforce recency limitation outside the model prompt as well. A model
-    # confidence label cannot make pretrained knowledge a verified latest study.
     evaluation["recency_sensitive"] = bool(RECENCY_REQUEST.search(question or ""))
     if evaluation["recency_sensitive"]:
         evaluation["fallback_confidence"] = "LOW"
@@ -511,8 +573,6 @@ Concise general educational information, or NONE.
             "has no live literature-search source to verify recency."
         )
 
-    # Guard against unsupported numeric BCS scales/targets in general-knowledge
-    # fallback text. The PDF-grounded answer is retained with its citations.
     bcs_question = bool(re.search(r"\b(?:BCS|body condition score|body condition scoring)\b", question or "", re.I))
     bcs_numeric_claim = bool(re.search(
         r"(?:\bBCS\b|body condition\w*)[^.\n]{0,100}\b\d+(?:\.\d+)?\b"
@@ -537,7 +597,6 @@ Concise general educational information, or NONE.
                 "The model classified the evidence as sufficient but "
                 "did not return a usable KB answer."
             )
-
     elif evaluation["status"] == "PARTIAL":
         if not evaluation["kb_answer"]:
             evaluation["status"] = "INSUFFICIENT"
@@ -547,7 +606,6 @@ Concise general educational information, or NONE.
         ):
             evaluation["fallback_confidence"] = "LOW"
             evaluation["fallback_answer"] = ""
-
     elif evaluation["status"] == "INSUFFICIENT":
         evaluation["kb_answer"] = ""
         if (
@@ -556,7 +614,6 @@ Concise general educational information, or NONE.
         ):
             evaluation["fallback_confidence"] = "LOW"
             evaluation["fallback_answer"] = ""
-
     else:
         evaluation["status"] = "INSUFFICIENT"
         evaluation["kb_answer"] = ""
@@ -628,65 +685,39 @@ def compose_final_answer(
     fallback_confidence: str,
     recency_sensitive: bool = False,
 ) -> str:
-    """Build the user-facing answer without exposing internal diagnostics."""
-
     if status == "SUFFICIENT":
         return kb_answer.strip()
 
     if status == "PARTIAL":
         parts = []
-
         if kb_answer.strip():
             parts.append(kb_answer.strip())
-
         if fallback_confidence == "HIGH" and fallback_answer.strip():
-            parts.append(
-                "Additional general information (not supported by the "
-                "local PDF knowledge base):\n\n"
-                + fallback_answer.strip()
-            )
+            parts.append(fallback_answer.strip())
         elif recency_sensitive:
             parts.append(
-                "The local documents do not contain the requested recent "
-                "research details. Internet/literature search is not enabled, "
-                "so I cannot verify which findings are currently the latest. "
-                "I have therefore not filled this gap with unverified model knowledge."
+                "Current research details are not available in the local documents."
             )
         elif not kb_answer.strip():
             parts.append(
-                "The local documents did not provide enough verified "
-                "information to answer this safely. Please consult a "
-                "qualified veterinarian."
+                "Not enough verified information is available. Please consult a qualified veterinarian."
             )
         else:
             parts.append(
-                "The local documents do not cover all parts of your "
-                "question, and reliable supplementary information could "
-                "not be established. Please consult a qualified veterinarian."
+                "Remaining details are not verified. Please consult a qualified veterinarian."
             )
-
         return "\n\n".join(parts)
 
     if fallback_confidence == "HIGH" and fallback_answer.strip():
-        return (
-            fallback_answer.strip()
-            + "\n\n"
-            "Note: This is general educational information from the model's "
-            "pretrained knowledge, not information supported by the local PDFs "
-            "or an individual veterinary assessment."
-        )
+        return fallback_answer.strip()
 
     if recency_sensitive:
         return (
-            "The local documents do not contain the requested recent research "
-            "details. Internet/literature search is not enabled, so I cannot "
-            "verify which findings are currently the latest. I have therefore "
-            "not filled this gap with unverified model knowledge."
+            "Current research details are not available in the local documents."
         )
 
     return (
-        "Not enough reliable information is available in the local "
-        "knowledge base or from the model's knowledge to answer this safely. "
+        "Not enough reliable information is available to answer this safely. "
         "Please consult a qualified veterinarian."
     )
 
@@ -700,32 +731,30 @@ def ask_question(question: str) -> None:
 
     timings = {
         "Guardrails": 0.0,
+        "ERP DB": 0.0,
         "Retrieval": 0.0,
         "Combined GLM request": 0.0,
     }
     responses = []
 
-    # 1. Domain and safety guardrails.
     stage_start = time.perf_counter()
     allowed, rejection_message = check_guardrails(question)
     record_stage(timings, "Guardrails", stage_start)
 
     if not allowed:
-        print("\nCATTLE HEALTH ASSISTANT\n")
+        print("\nRAGUL\n")
         print(rejection_message)
         if SHOW_DIAGNOSTICS:
             display_timing(timings, total_start)
         return
 
-    # Block individualized veterinary medication requests before retrieval.
     if is_individualized_medication_request(question):
-        print("\nCATTLE HEALTH ASSISTANT\n")
+        print("\nRAGUL\n")
         print(medication_safety_response())
         if SHOW_DIAGNOSTICS:
             display_timing(timings, total_start)
         return
 
-    # Handle simple greetings without retrieval or generation.
     greetings = {
         "hello",
         "hi",
@@ -735,20 +764,25 @@ def ask_question(question: str) -> None:
         "good evening",
     }
     if question.strip().lower() in greetings:
-        print(
-            "\nCATTLE HEALTH ASSISTANT\n"
-            "Hello! I can help with cattle diseases, health, "
-            "nutrition and dairy farming."
-        )
+        print("\nRAGUL\nHello.")
         return
 
-    # 2. Retrieve passages from the local PDF knowledge base.
+    if ERP_QUERY_PATTERN.search(question):
+        stage_start = time.perf_counter()
+        erp_answer = query_database_erp(question)
+        record_stage(timings, "ERP DB", stage_start)
+        if erp_answer:
+            print("\nRAGUL\n")
+            print(erp_answer)
+            if SHOW_DIAGNOSTICS:
+                display_timing(timings, total_start)
+            return
+
     stage_start = time.perf_counter()
     results = retrieve_context(question, top_k=5)
     record_stage(timings, "Retrieval", stage_start)
     context = build_context(results) if results else ""
 
-    # 3. One GLM request: evidence assessment + KB answer + conditional fallback.
     stage_start = time.perf_counter()
     evaluation, response = assess_and_generate_complete_answer(
         question,
@@ -780,7 +814,7 @@ def ask_question(question: str) -> None:
         recency_sensitive=evaluation.get("recency_sensitive", False),
     )
 
-    print("\nCATTLE HEALTH ASSISTANT\n")
+    print("\nRAGUL\n")
     print(final_answer)
 
     if SHOW_DIAGNOSTICS:
@@ -794,17 +828,8 @@ def ask_question(question: str) -> None:
 
 def main() -> None:
     print("\n========================================")
-    print("       CATTLE HEALTH RAG ASSISTANT")
+    print("       RAGUL - CATTLE & FARM ASSISTANT")
     print("========================================")
-
-    print("Ask questions about:")
-    print("- Cattle diseases")
-    print("- Mastitis, FMD and LSD")
-    print("- Body Condition Scoring")
-    print("- Dairy nutrition and livestock management")
-
-    print("\nCurrently using: Local PDF Knowledge Base")
-    print("Internet search: Not enabled yet")
     print("Type 'exit' to quit.")
 
     while True:
@@ -812,24 +837,20 @@ def main() -> None:
             question = input("\nYou: ").strip()
 
             if question.lower() in ("exit", "quit"):
-                print("\nThank you for using the Cattle Health Assistant!")
                 break
 
             if not question:
-                print("Please enter a question.")
                 continue
 
             ask_question(question)
 
         except KeyboardInterrupt:
-            print("\n\nAssistant stopped.")
+            print("\n")
             break
 
         except Exception as error:
-            # Do not expose stack traces, API payloads, or secrets to users.
             print(
-                "\nThe assistant encountered an error while processing "
-                "your question. Please try again."
+                "\nUnable to process that request right now. Please try again."
             )
             if SHOW_DIAGNOSTICS:
                 print(f"Diagnostic error: {type(error).__name__}: {error}")
